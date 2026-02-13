@@ -102,6 +102,7 @@ let flashAlpha = 0;
 let pointerX = AREA_X + AREA_W / 2;
 let dropCooldownTimer = null;
 let isNewRecord = false;
+let showTitle = true;
 
 // Mission
 let currentMission = null;
@@ -654,13 +655,14 @@ function setupInput() {
   }
 
   canvas.addEventListener('mousemove', (e) => {
-    if (gameOver) return;
+    if (gameOver || showTitle) return;
     const g = toGameCoords(e.clientX, e.clientY);
     pointerX = g.x;
     updateHeldPos();
   });
 
   canvas.addEventListener('mousedown', (e) => {
+    if (showTitle) { showTitle = false; return; }
     const g = toGameCoords(e.clientX, e.clientY);
     if (gameOver) {
       tryRetry(g.x, g.y);
@@ -675,6 +677,7 @@ function setupInput() {
   let touchActive = false;
   canvas.addEventListener('touchstart', (e) => {
     e.preventDefault();
+    if (showTitle) { showTitle = false; return; }
     const t = e.touches[0];
     const g = toGameCoords(t.clientX, t.clientY);
     if (gameOver) return;
@@ -745,7 +748,7 @@ function loop(ts) {
   const elapsed = lastTime ? Math.min(ts - lastTime, 50) : FIXED_DT;
   lastTime = ts;
 
-  if (!gameOver) {
+  if (!gameOver && !showTitle) {
     updateHeldPos();
     accumulator += elapsed;
     while (accumulator >= FIXED_DT) {
@@ -781,6 +784,11 @@ function cleanupOutOfBounds() {
 function render() {
   ctx.save();
   ctx.scale(canvasScale, canvasScale);
+  if (showTitle) {
+    drawTitleScreen();
+    ctx.restore();
+    return;
+  }
   ctx.translate(shakeAmount, 0);
 
   // Background
@@ -1249,10 +1257,20 @@ function drawPingPong(r, d) {
   g.addColorStop(1, 'rgba(230,230,230,0.1)');
   ctx.fillStyle = g;
   ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Brand stripe (like official balls)
+  ctx.fillStyle = 'rgba(255,138,101,0.3)';
+  ctx.fillRect(-r, -r * 0.07, r * 2, r * 0.14);
 }
 
 function drawGolfBall(r, d) {
   ctx.fillStyle = d.color;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // 3D gradient
+  const g = ctx.createRadialGradient(-r * 0.25, -r * 0.3, 0, 0, 0, r);
+  g.addColorStop(0, 'rgba(255,255,255,0.4)');
+  g.addColorStop(0.5, 'rgba(255,255,255,0)');
+  g.addColorStop(1, 'rgba(200,185,0,0.08)');
+  ctx.fillStyle = g;
   ctx.fillRect(-r, -r, r * 2, r * 2);
   // Dimples
   ctx.fillStyle = 'rgba(180,170,100,0.4)';
@@ -1277,6 +1295,14 @@ function drawSquashBall(r, d) {
   g.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = g;
   ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Yellow speed dots (like real squash balls)
+  ctx.fillStyle = '#FFD600';
+  ctx.beginPath();
+  ctx.arc(r * 0.28, r * 0.22, r * 0.12, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(r * 0.48, r * 0.22, r * 0.12, 0, Math.PI * 2);
+  ctx.fill();
 }
 
 function drawTennisBall(r, d) {
@@ -1357,6 +1383,14 @@ function drawSoftball(r, d) {
 function drawHandball(r, d) {
   ctx.fillStyle = d.color;
   ctx.fillRect(-r, -r, r * 2, r * 2);
+  // 3D gradient
+  const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, 0, 0, 0, r);
+  g.addColorStop(0, 'rgba(255,255,255,0.25)');
+  g.addColorStop(0.6, 'rgba(255,255,255,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.1)');
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Panel lines
   ctx.strokeStyle = 'rgba(255,255,255,0.7)';
   ctx.lineWidth = Math.max(2, r * 0.1);
   ctx.beginPath();
@@ -1367,6 +1401,15 @@ function drawHandball(r, d) {
   ctx.moveTo(-r * 0.65, r * 0.78);
   ctx.quadraticCurveTo(0, r * 0.05, r * 0.65, r * 0.78);
   ctx.stroke();
+  // Grip texture dots
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  for (let gi = 0; gi < 5; gi++) {
+    for (let gj = 0; gj < 3; gj++) {
+      ctx.beginPath();
+      ctx.arc(-r * 0.24 + gi * r * 0.12, -r * 0.08 + gj * r * 0.08, r * 0.02, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
 }
 
 function drawSoccerBall(r, d) {
@@ -1410,6 +1453,13 @@ function drawVolleyball(r, d) {
   g.addColorStop(1, '#1E88E5');
   ctx.fillStyle = g;
   ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Subtle yellow panel fill
+  ctx.fillStyle = 'rgba(255,235,59,0.07)';
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.quadraticCurveTo(r * 0.35, 0, 0, r);
+  ctx.quadraticCurveTo(-r * 0.1, 0, 0, -r);
+  ctx.fill();
   // Panel lines
   ctx.strokeStyle = 'rgba(255,255,255,0.75)';
   ctx.lineWidth = Math.max(1.5, r * 0.045);
@@ -1453,15 +1503,25 @@ function drawBalanceBall(r, d) {
   g.addColorStop(1, '#C2185B');
   ctx.fillStyle = g;
   ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Vertical ribs (balance ball grooves)
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = r * 0.02;
+  for (let ri = -3; ri <= 3; ri++) {
+    const rx = ri * r * 0.22;
+    ctx.beginPath();
+    ctx.moveTo(rx, -r);
+    ctx.lineTo(rx, r);
+    ctx.stroke();
+  }
   // Highlight ellipse
   ctx.beginPath();
   ctx.ellipse(-r * 0.28, -r * 0.3, r * 0.35, r * 0.2, -Math.PI / 4, 0, Math.PI * 2);
   ctx.fillStyle = 'rgba(255,255,255,0.35)';
   ctx.fill();
-  // Subtle equator ring
+  // Equator ring
   ctx.beginPath();
   ctx.arc(0, 0, r * 0.72, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
   ctx.lineWidth = r * 0.03;
   ctx.stroke();
 }
@@ -1511,6 +1571,166 @@ function drawChainTexts() {
     ctx.fillText(c.text, cx, cy);
     ctx.restore();
   }
+}
+
+function drawTitleScreen() {
+  // Gradient background
+  const bgGrad = ctx.createLinearGradient(0, 0, 0, GAME_HEIGHT);
+  bgGrad.addColorStop(0, '#3E2723');
+  bgGrad.addColorStop(0.5, '#2D1B14');
+  bgGrad.addColorStop(1, '#1A0E0A');
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+
+  const cx = GAME_WIDTH / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // Title shadow + text
+  ctx.font = 'bold 34px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillText('Ball Merge Game', cx + 2, 37);
+  ctx.fillStyle = '#FFECB3';
+  ctx.fillText('Ball Merge Game', cx, 35);
+
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#8D6E63';
+  ctx.fillText('スポーツボール落ちものパズル', cx, 58);
+
+  if (highScore > 0) {
+    ctx.font = 'bold 12px "Segoe UI", Arial, sans-serif';
+    ctx.fillStyle = '#FFD54F';
+    ctx.fillText('HIGH SCORE: ' + highScore, cx, 78);
+  }
+
+  // Evolution chart
+  const chartBaseY = highScore > 0 ? 105 : 95;
+  const chartW = GAME_WIDTH - 60;
+  const csp = chartW / 10;
+  for (let i = 1; i <= MAX_LEVEL; i++) {
+    const bx = 30 + (i - 1) * csp;
+    ctx.save();
+    drawBallGraphic(bx, chartBaseY, 8, i);
+    ctx.restore();
+  }
+  ctx.font = '8px "Segoe UI", sans-serif';
+  ctx.fillStyle = '#5D4037';
+  ctx.textAlign = 'left';
+  ctx.fillText('Lv.1', 18, chartBaseY + 16);
+  ctx.textAlign = 'right';
+  ctx.fillText('Lv.11', GAME_WIDTH - 18, chartBaseY + 16);
+
+  // ── あそびかた ──
+  const playY = chartBaseY + 36;
+  drawTitleSectionLine(playY, 'あそびかた', '#FFECB3');
+
+  ctx.textAlign = 'left';
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  const rules = [
+    '左右に動かして落下位置を調整',
+    'クリック / タップでボールを落とす',
+    '同じボール同士がぶつかると合体して進化！',
+    '最大レベル(Lv.11)同士は消滅してボーナス',
+    '赤いラインを超え続けるとゲームオーバー'
+  ];
+  for (let i = 0; i < rules.length; i++) {
+    const ry = playY + 24 + i * 20;
+    ctx.fillStyle = '#8D6E63';
+    ctx.fillText('\u25B8', 28, ry);
+    ctx.fillStyle = '#D7CCC8';
+    ctx.fillText(rules[i], 42, ry);
+  }
+
+  // ── 連鎖ボーナス ──
+  const chainSecY = playY + 24 + rules.length * 20 + 16;
+  drawTitleSectionLine(chainSecY, '連鎖ボーナス', '#FFECB3');
+  ctx.textAlign = 'center';
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#D7CCC8';
+  ctx.fillText('合体が連続すると連鎖ボーナス！', cx, chainSecY + 22);
+  ctx.font = '11px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#FFCC80';
+  ctx.fillText('2連鎖\u00D71.5   3連鎖\u00D72.0   4連鎖\u00D72.5 ...', cx, chainSecY + 42);
+
+  // ── ボムシステム ──
+  const bombSecY = chainSecY + 68;
+  drawTitleSectionLine(bombSecY, 'ボムシステム', '#FF9800');
+
+  // Bomb icon on left
+  ctx.save();
+  drawBombGraphic(50, bombSecY + 70, 20, 3);
+  ctx.restore();
+
+  ctx.textAlign = 'left';
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  const bombRules = [
+    'ミッションクリアでボムを獲得！',
+    '右上の BOMB ボタンでモード切替',
+    'ボムモードでボールを落とすと爆弾に変化',
+    '爆弾は何かにぶつかると大爆発！',
+    '爆発範囲内の同レベル以下のボールを破壊'
+  ];
+  for (let i = 0; i < bombRules.length; i++) {
+    const ry = bombSecY + 24 + i * 21;
+    ctx.fillStyle = '#BF360C';
+    ctx.fillText('\u25B8', 82, ry);
+    ctx.fillStyle = '#FFCC80';
+    ctx.fillText(bombRules[i], 96, ry);
+  }
+  ctx.font = '10px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#795548';
+  ctx.textAlign = 'left';
+  const noteY = bombSecY + 24 + bombRules.length * 21 + 6;
+  ctx.fillText('\u203B \u7206\u5F3E\u306E\u30EC\u30D9\u30EB = \u843D\u3068\u3059\u30DC\u30FC\u30EB\u306E\u30EC\u30D9\u30EB', 82, noteY);
+  ctx.fillText('\u203B \u30EC\u30D9\u30EB\u304C\u9AD8\u3044\u307B\u3069\u7206\u767A\u7BC4\u56F2\u304C\u5E83\u3044', 82, noteY + 16);
+
+  // ── ミッション ──
+  const missionSecY = noteY + 44;
+  drawTitleSectionLine(missionSecY, 'ミッション', '#4CAF50');
+  ctx.textAlign = 'center';
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#A5D6A7';
+  ctx.fillText('プレイ中にミッションが出現！', cx, missionSecY + 22);
+  ctx.fillText('達成するとボムを獲得できる', cx, missionSecY + 42);
+
+  // ── START PROMPT ──
+  const startY = Math.max(missionSecY + 80, 650);
+  const pulse = 0.6 + Math.sin(Date.now() * 0.004) * 0.4;
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  ctx.font = 'bold 24px "Segoe UI", Arial, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFECB3';
+  ctx.fillText('TAP TO START', cx, startY);
+  ctx.restore();
+
+  ctx.font = '10px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#5D4037';
+  ctx.textAlign = 'center';
+  ctx.fillText('\u30AF\u30EA\u30C3\u30AF or \u30BF\u30C3\u30D7\u3067\u30B2\u30FC\u30E0\u958B\u59CB', cx, startY + 25);
+}
+
+function drawTitleSectionLine(y, text, color) {
+  const cx = GAME_WIDTH / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 14px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = color || '#FFECB3';
+  const tw = ctx.measureText(text).width;
+  ctx.save();
+  ctx.strokeStyle = color || '#FFECB3';
+  ctx.globalAlpha = 0.3;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(30, y);
+  ctx.lineTo(cx - tw / 2 - 10, y);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx + tw / 2 + 10, y);
+  ctx.lineTo(GAME_WIDTH - 30, y);
+  ctx.stroke();
+  ctx.restore();
+  ctx.fillText(text, cx, y);
 }
 
 function drawGameOverScreen() {
