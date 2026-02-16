@@ -1,0 +1,1796 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Ball Merge Game</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #3E2723;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -ms-user-select: none;
+}
+body {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+}
+canvas {
+  display: block;
+  touch-action: none;
+}
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+(function() {
+'use strict';
+
+// ========== CONSTANTS ==========
+const GAME_WIDTH = 420;
+const GAME_HEIGHT = 720;
+const AREA_X = 10;
+const AREA_Y = 140;
+const AREA_W = 400;
+const AREA_H = 570;
+const WALL_T = 10;
+const DEADLINE_Y = AREA_Y + 80;
+const DROP_Y = AREA_Y + 35;
+
+const BALL_DATA = [
+  null,
+  { name: 'ピンポン玉',       r: 15,  score: 10,   color: '#FFF3E0', outline: '#FFAB91' },
+  { name: 'ゴルフボール',     r: 20,  score: 30,   color: '#FFFDE7', outline: '#C8B900' },
+  { name: 'スカッシュボール', r: 26,  score: 60,   color: '#212121', outline: '#616161' },
+  { name: 'テニスボール',     r: 33,  score: 100,  color: '#CDDC39', outline: '#9E9D24' },
+  { name: '野球ボール',       r: 41,  score: 150,  color: '#ECEFF1', outline: '#90A4AE' },
+  { name: 'ソフトボール',     r: 50,  score: 210,  color: '#FFF176', outline: '#F9A825' },
+  { name: 'ハンドボール',     r: 60,  score: 280,  color: '#FF8A65', outline: '#D84315' },
+  { name: 'サッカーボール',   r: 71,  score: 360,  color: '#E0E0E0', outline: '#616161' },
+  { name: 'バレーボール',     r: 83,  score: 450,  color: '#42A5F5', outline: '#1565C0' },
+  { name: 'バスケットボール', r: 96,  score: 550,  color: '#E65100', outline: '#BF360C' },
+  { name: 'バランスボール',   r: 110, score: 660,  color: '#EC407A', outline: '#AD1457' }
+];
+const MAX_LEVEL = 11;
+const BALANCE_BONUS = 1000;
+const CHAIN_TIMEOUT = 1500;
+const DEADLINE_DURATION = 2000;
+const DROP_COOLDOWN_MS = 500;
+
+// ========== MATTER.JS ==========
+const { Engine, World, Bodies, Body, Events, Composite } = Matter;
+
+// ========== STATE ==========
+let engine, world;
+let canvas, ctx;
+let canvasScale = 1;
+
+let score = 0;
+let highScore = parseInt(localStorage.getItem('ballMergeHighScore')) || 0;
+let gameOver = false;
+
+let currentLevel = 0;
+let nextLevel = 0;
+let dropX = AREA_X + AREA_W / 2;
+let canDrop = true;
+let currentBall = null;
+
+let ballBodies = new Map(); // body.id -> { level, createdAt }
+let mergeQueue = [];
+let mergedThisFrame = new Set();
+
+let chainCount = 0;
+let chainTimer = 0;
+let lastDropTime = 0;
+
+let deadlineTimer = 0;
+let shakeAmount = 0;
+
+let particles = [];
+let floatTexts = [];
+let chainTexts = [];
+let flashAlpha = 0;
+
+let pointerX = AREA_X + AREA_W / 2;
+let dropCooldownTimer = null;
+let isNewRecord = false;
+let showTitle = true;
+
+// Mission
+let currentMission = null;
+let missionCount = 0;
+let missionCompleteEffect = null;
+let missionTransitionTimer = 0;
+
+// Bomb
+let bombStock = 0;
+let bombMode = false;
+let bombExplosions = [];
+
+// Mission tracking
+let totalMergeCount = 0;
+let lastMissionType = null;
+
+// ========== INIT ==========
+function init() {
+  canvas = document.getElementById('gameCanvas');
+  ctx = canvas.getContext('2d');
+
+  engine = Engine.create({ enableSleeping: false });
+  engine.gravity.y = 1.5;
+  world = engine.world;
+
+  createWalls();
+
+  currentLevel = randLevel();
+  nextLevel = randLevel();
+  spawnHeldBall();
+
+  Events.on(engine, 'collisionStart', onCollision);
+  Events.on(engine, 'collisionActive', onCollision);
+  generateNextMission();
+  setupInput();
+  handleResize();
+  window.addEventListener('resize', handleResize);
+  requestAnimationFrame(loop);
+}
+
+function handleResize() {
+  const ww = window.innerWidth;
+  const wh = window.innerHeight;
+  canvasScale = Math.min(ww / GAME_WIDTH, wh / GAME_HEIGHT);
+  if (ww >= 600) canvasScale = Math.min(canvasScale, 1.2);
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(GAME_WIDTH * canvasScale * dpr);
+  canvas.height = Math.floor(GAME_HEIGHT * canvasScale * dpr);
+  canvas.style.width = Math.floor(GAME_WIDTH * canvasScale) + 'px';
+  canvas.style.height = Math.floor(GAME_HEIGHT * canvasScale) + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function createWalls() {
+  const PW = 40; // Physics wall thickness (thick to prevent tunneling)
+  const PH = AREA_H + 200; // Extend walls above and below game area
+  const o = { isStatic: true, friction: 0.3, restitution: 0.2 };
+  World.add(world, [
+    Bodies.rectangle(AREA_X + AREA_W / 2, AREA_Y + AREA_H + PW / 2, AREA_W + PW * 2, PW, o),
+    Bodies.rectangle(AREA_X - PW / 2, AREA_Y + AREA_H / 2, PW, PH, o),
+    Bodies.rectangle(AREA_X + AREA_W + PW / 2, AREA_Y + AREA_H / 2, PW, PH, o)
+  ]);
+}
+
+function randLevel() {
+  return Math.floor(Math.random() * 5) + 1;
+}
+
+function clampDropX(level) {
+  const r = BALL_DATA[level].r;
+  return Math.max(AREA_X + r + 2, Math.min(AREA_X + AREA_W - r - 2, dropX));
+}
+
+function spawnHeldBall() {
+  const cx = clampDropX(currentLevel);
+  const r = BALL_DATA[currentLevel].r;
+  const body = Bodies.circle(cx, DROP_Y, r, {
+    isStatic: true,
+    restitution: 0.3, friction: 0.1, frictionAir: 0.01, slop: 0.5,
+    label: 'ball',
+    collisionFilter: { group: -1 }
+  });
+  body.ballLevel = currentLevel;
+  World.add(world, body);
+  currentBall = body;
+}
+
+function doDrop() {
+  if (!canDrop || gameOver || !currentBall) return;
+  const cx = clampDropX(currentLevel);
+  Body.setPosition(currentBall, { x: cx, y: DROP_Y });
+  Body.setStatic(currentBall, false);
+  currentBall.collisionFilter.group = 0;
+
+  const isBomb = bombMode && bombStock > 0;
+  if (isBomb) {
+    currentBall.label = 'bomb';
+    bombStock--;
+    bombMode = false;
+  }
+
+  const now = Date.now();
+  ballBodies.set(currentBall.id, { level: currentLevel, createdAt: now, isBomb });
+  currentBall = null;
+
+  lastDropTime = now;
+  canDrop = false;
+
+  currentLevel = nextLevel;
+  nextLevel = randLevel();
+
+  dropCooldownTimer = setTimeout(() => {
+    dropCooldownTimer = null;
+    canDrop = true;
+    if (!gameOver) spawnHeldBall();
+  }, DROP_COOLDOWN_MS);
+}
+
+// ========== COLLISION ==========
+function onCollision(event) {
+  for (const pair of event.pairs) {
+    const a = pair.bodyA, b = pair.bodyB;
+
+    // Bomb collision (priority check)
+    const aIsBomb = a.label === 'bomb';
+    const bIsBomb = b.label === 'bomb';
+    if (aIsBomb || bIsBomb) {
+      const bomb = aIsBomb ? a : b;
+      if (mergedThisFrame.has(bomb.id)) continue;
+      mergedThisFrame.add(bomb.id);
+      const info = ballBodies.get(bomb.id);
+      if (info) {
+        mergeQueue.push({ type: 'BOMB', bomb, level: info.level });
+      }
+      continue;
+    }
+
+    if (a.label !== 'ball' || b.label !== 'ball') continue;
+    const da = ballBodies.get(a.id), db = ballBodies.get(b.id);
+    if (!da || !db) continue;
+    if (da.level !== db.level) continue;
+    if (mergedThisFrame.has(a.id) || mergedThisFrame.has(b.id)) continue;
+    mergedThisFrame.add(a.id);
+    mergedThisFrame.add(b.id);
+    mergeQueue.push({ a, b, level: da.level });
+  }
+}
+
+function processMerges() {
+  const allBodies = new Set(Composite.allBodies(world).map(b => b.id));
+
+  while (mergeQueue.length > 0) {
+    const entry = mergeQueue.shift();
+
+    // Bomb explosion
+    if (entry.type === 'BOMB') {
+      processBombExplosion(entry, allBodies);
+      continue;
+    }
+
+    const { a, b, level } = entry;
+    if (!allBodies.has(a.id) || !allBodies.has(b.id)) continue;
+
+    const midX = (a.position.x + b.position.x) / 2;
+    const midY = (a.position.y + b.position.y) / 2;
+    const avgVx = (a.velocity.x + b.velocity.x) / 2;
+    const avgVy = (a.velocity.y + b.velocity.y) / 2;
+
+    World.remove(world, a);
+    World.remove(world, b);
+    ballBodies.delete(a.id);
+    ballBodies.delete(b.id);
+    allBodies.delete(a.id);
+    allBodies.delete(b.id);
+
+    const now = Date.now();
+    if (chainTimer > 0 && (now - chainTimer) < CHAIN_TIMEOUT) {
+      chainCount++;
+    } else {
+      chainCount = 1;
+    }
+    chainTimer = now;
+    const mult = 1.0 + 0.5 * (chainCount - 1);
+
+    totalMergeCount++;
+
+    if (level >= MAX_LEVEL) {
+      const pts = Math.floor(BALANCE_BONUS * mult);
+      score += pts;
+      spawnParticles(midX, midY, BALL_DATA[MAX_LEVEL].color, 24, true);
+      addFloatText(midX, midY, '+' + pts, '#FF4081');
+      flashAlpha = 0.6;
+      checkMissionProgress({ type: 'MERGE', newLevel: MAX_LEVEL, score: pts });
+    } else {
+      const nl = level + 1;
+      const nd = BALL_DATA[nl];
+      const pts = Math.floor(nd.score * mult);
+      score += pts;
+
+      const clampedX = Math.max(AREA_X + nd.r + 1, Math.min(AREA_X + AREA_W - nd.r - 1, midX));
+      const clampedY = Math.min(AREA_Y + AREA_H - nd.r - 1, midY);
+      const nb = Bodies.circle(clampedX, clampedY, nd.r, {
+        restitution: 0.3, friction: 0.1, frictionAir: 0.01, slop: 0.5,
+        label: 'ball'
+      });
+      nb.ballLevel = nl;
+      let nvx = avgVx * 0.5, nvy = avgVy * 0.5;
+      const spd = Math.sqrt(nvx * nvx + nvy * nvy);
+      const MAX_MERGE_SPEED = 8;
+      if (spd > MAX_MERGE_SPEED) {
+        const s = MAX_MERGE_SPEED / spd;
+        nvx *= s; nvy *= s;
+      }
+      Body.setVelocity(nb, { x: nvx, y: nvy });
+      World.add(world, nb);
+      ballBodies.set(nb.id, { level: nl, createdAt: now, fromMerge: true });
+      allBodies.add(nb.id);
+
+      spawnParticles(midX, midY, nd.color, 12, false);
+      addFloatText(midX, midY, '+' + pts, '#FFC107');
+      checkMissionProgress({ type: 'MERGE', newLevel: nl, score: pts });
+    }
+
+    if (chainCount >= 2) {
+      addChainText(chainCount);
+      checkMissionProgress({ type: 'CHAIN', count: chainCount });
+    }
+    if (score > highScore) {
+      highScore = score;
+    }
+  }
+  mergedThisFrame.clear();
+}
+
+function processBombExplosion(entry, allBodiesSet) {
+  const { bomb, level } = entry;
+  if (!allBodiesSet.has(bomb.id)) return;
+
+  const bx = bomb.position.x;
+  const by = bomb.position.y;
+  const bombR = BALL_DATA[level].r;
+  const explosionRadius = Math.max(80, bombR * 2.5);
+
+  World.remove(world, bomb);
+  ballBodies.delete(bomb.id);
+  allBodiesSet.delete(bomb.id);
+
+  // Build body map for lookup
+  const bodyMap = new Map();
+  for (const b of Composite.allBodies(world)) {
+    bodyMap.set(b.id, b);
+  }
+
+  // Find and destroy balls within radius with level <= bomb level
+  let destroyCount = 0;
+  const toRemove = [];
+
+  for (const [id, info] of ballBodies) {
+    if (info.level > level) continue;
+    const body = bodyMap.get(id);
+    if (!body) continue;
+    const dx = body.position.x - bx;
+    const dy = body.position.y - by;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const targetR = BALL_DATA[info.level].r;
+    if (dist - targetR < explosionRadius) {
+      toRemove.push({ id, body, info });
+    }
+  }
+
+  for (const { id, body, info } of toRemove) {
+    World.remove(world, body);
+    ballBodies.delete(id);
+    allBodiesSet.delete(id);
+    score += 5 * info.level;
+    destroyCount++;
+    spawnParticles(body.position.x, body.position.y, BALL_DATA[info.level].color, 6, false);
+  }
+
+  // Explosion effect
+  bombExplosions.push({
+    x: bx, y: by,
+    maxRadius: explosionRadius,
+    alpha: 1,
+    life: 600,
+    elapsed: 0
+  });
+
+  flashAlpha = 0.3;
+  spawnParticles(bx, by, '#FF9800', 18, true);
+
+  if (destroyCount > 0) {
+    addFloatText(bx, by, 'BOMB! x' + destroyCount, '#FF6D00');
+  } else {
+    addFloatText(bx, by, 'BOMB!', '#FF6D00');
+  }
+
+  checkMissionProgress({ type: 'DESTROY_BOMB', count: destroyCount });
+
+  if (score > highScore) {
+    highScore = score;
+  }
+}
+
+// ========== MISSION SYSTEM ==========
+function generateNextMission() {
+  const difficulty = Math.floor(missionCount * 0.7);
+  const types = ['CREATE_LEVEL', 'MERGE_COUNT', 'CHAIN_COUNT', 'SCORE_SINGLE', 'DESTROY_BOMB'];
+
+  let available = types.filter(t => {
+    if (t === 'DESTROY_BOMB' && (missionCount < 1 || bombStock < 1)) return false;
+    if (t === lastMissionType) return false;
+    return true;
+  });
+  if (available.length === 0) available = types.filter(t => t !== 'DESTROY_BOMB' || (missionCount >= 1 && bombStock >= 1));
+
+  const type = available[Math.floor(Math.random() * available.length)];
+  let goal, description, shortDesc;
+
+  switch (type) {
+    case 'CREATE_LEVEL': {
+      const minLv = Math.min(4 + Math.floor(difficulty * 0.7), MAX_LEVEL);
+      const maxLv = Math.min(minLv + 2, MAX_LEVEL);
+      goal = minLv + Math.floor(Math.random() * (maxLv - minLv + 1));
+      description = BALL_DATA[goal].name + 'を作れ!';
+      shortDesc = 'Lv.' + goal + ' 作成';
+      break;
+    }
+    case 'MERGE_COUNT':
+      goal = 3 + Math.floor(difficulty * 1.2);
+      description = goal + '回合体しろ!';
+      shortDesc = goal + '回合体';
+      break;
+    case 'CHAIN_COUNT':
+      goal = Math.min(2 + Math.floor(difficulty * 0.4), 8);
+      description = goal + 'チェイン達成!';
+      shortDesc = goal + 'チェイン';
+      break;
+    case 'SCORE_SINGLE':
+      goal = 100 + difficulty * 50;
+      description = '1回の合体で' + goal + '点!';
+      shortDesc = goal + '点獲得';
+      break;
+    case 'DESTROY_BOMB':
+      goal = Math.min(2 + Math.floor(difficulty * 0.3), 8);
+      description = 'ボムで' + goal + '個破壊!';
+      shortDesc = goal + '個破壊';
+      break;
+  }
+
+  currentMission = { type, progress: 0, goal, description, shortDesc };
+}
+
+function checkMissionProgress(event) {
+  if (!currentMission) return;
+
+  let completed = false;
+
+  switch (currentMission.type) {
+    case 'CREATE_LEVEL':
+      if (event.type === 'MERGE') {
+        currentMission.progress = Math.max(currentMission.progress, event.newLevel);
+        if (currentMission.progress >= currentMission.goal) completed = true;
+      }
+      break;
+    case 'MERGE_COUNT':
+      if (event.type === 'MERGE') {
+        currentMission.progress++;
+        if (currentMission.progress >= currentMission.goal) completed = true;
+      }
+      break;
+    case 'CHAIN_COUNT':
+      if (event.type === 'CHAIN') {
+        currentMission.progress = Math.max(currentMission.progress, event.count);
+        if (currentMission.progress >= currentMission.goal) completed = true;
+      }
+      break;
+    case 'SCORE_SINGLE':
+      if (event.type === 'MERGE') {
+        currentMission.progress = Math.max(currentMission.progress, event.score);
+        if (currentMission.progress >= currentMission.goal) completed = true;
+      }
+      break;
+    case 'DESTROY_BOMB':
+      if (event.type === 'DESTROY_BOMB') {
+        currentMission.progress += event.count;
+        if (currentMission.progress >= currentMission.goal) completed = true;
+      }
+      break;
+  }
+
+  if (completed) {
+    lastMissionType = currentMission.type;
+    missionCount++;
+    bombStock++;
+    missionCompleteEffect = { alpha: 1, life: 1500, elapsed: 0 };
+    missionTransitionTimer = 300;
+    currentMission = null;
+  }
+}
+
+// ========== EFFECTS ==========
+function spawnParticles(x, y, color, count, big) {
+  for (let i = 0; i < count; i++) {
+    const ang = (Math.PI * 2 * i) / count + Math.random() * 0.4;
+    const spd = (big ? 4 : 2) + Math.random() * 3;
+    particles.push({
+      x, y,
+      vx: Math.cos(ang) * spd,
+      vy: Math.sin(ang) * spd,
+      r: big ? 4 + Math.random() * 4 : 2 + Math.random() * 3,
+      color, alpha: 1, life: 500
+    });
+  }
+}
+
+function addFloatText(x, y, text, color) {
+  floatTexts.push({ x, y, text, color, alpha: 1, vy: -2, life: 1000 });
+}
+
+function addChainText(count) {
+  chainTexts.push({
+    text: count + ' Chain!',
+    alpha: 1, scl: 0.5, life: 1200,
+    color: count >= 5 ? '#E040FB' : count >= 4 ? '#FF4081' : count >= 3 ? '#FF9800' : '#FFEB3B'
+  });
+}
+
+function updateEffects(dt) {
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.1;
+    p.alpha -= dt / p.life;
+  }
+  particles = particles.filter(p => p.alpha > 0);
+  for (const f of floatTexts) {
+    f.y += f.vy; f.alpha -= dt / f.life;
+  }
+  floatTexts = floatTexts.filter(f => f.alpha > 0);
+  for (const c of chainTexts) {
+    c.alpha -= dt / c.life;
+    c.scl = Math.min(c.scl + dt * 0.003, 1.5);
+  }
+  chainTexts = chainTexts.filter(c => c.alpha > 0);
+  if (flashAlpha > 0) { flashAlpha -= dt * 0.003; if (flashAlpha < 0) flashAlpha = 0; }
+
+  // Bomb explosions
+  for (const e of bombExplosions) {
+    e.elapsed += dt;
+    e.alpha = 1 - e.elapsed / e.life;
+  }
+  bombExplosions = bombExplosions.filter(e => e.alpha > 0);
+
+  // Mission transition timer
+  if (missionTransitionTimer > 0) {
+    missionTransitionTimer -= dt;
+    if (missionTransitionTimer <= 0) {
+      missionTransitionTimer = 0;
+      generateNextMission();
+    }
+  }
+
+  // Mission complete effect
+  if (missionCompleteEffect) {
+    missionCompleteEffect.elapsed += dt;
+    missionCompleteEffect.alpha = 1 - missionCompleteEffect.elapsed / missionCompleteEffect.life;
+    if (missionCompleteEffect.alpha <= 0) missionCompleteEffect = null;
+  }
+
+  if (deadlineTimer > 0 && !gameOver) {
+    shakeAmount = Math.sin(Date.now() * 0.05) * 3 * Math.min(1, deadlineTimer / DEADLINE_DURATION);
+  } else {
+    shakeAmount *= 0.9;
+    if (Math.abs(shakeAmount) < 0.1) shakeAmount = 0;
+  }
+}
+
+// ========== DEADLINE ==========
+function checkDeadline(dt) {
+  if (gameOver) return;
+  const now = Date.now();
+  let danger = false;
+  for (const body of frameAllBodies) {
+    if ((body.label !== 'ball' && body.label !== 'bomb') || body.isStatic) continue;
+    const info = ballBodies.get(body.id);
+    if (!info) continue;
+    if (!info.fromMerge && now - info.createdAt < 1000) continue;
+    const r = BALL_DATA[info.level].r;
+    if (body.position.y - r < DEADLINE_Y) { danger = true; break; }
+  }
+  if (danger) {
+    deadlineTimer += dt;
+    if (deadlineTimer >= DEADLINE_DURATION) triggerGameOver();
+  } else {
+    deadlineTimer = Math.max(0, deadlineTimer - dt * 2);
+  }
+}
+
+function triggerGameOver() {
+  gameOver = true;
+  canDrop = false;
+  bombMode = false;
+  if (currentBall) { World.remove(world, currentBall); currentBall = null; }
+  const savedHigh = parseInt(localStorage.getItem('ballMergeHighScore')) || 0;
+  isNewRecord = score > savedHigh;
+  if (score > savedHigh) {
+    highScore = score;
+    localStorage.setItem('ballMergeHighScore', highScore);
+  }
+}
+
+function resetGame() {
+  if (dropCooldownTimer) {
+    clearTimeout(dropCooldownTimer);
+    dropCooldownTimer = null;
+  }
+  const bodies = Composite.allBodies(world);
+  for (const body of bodies) {
+    if (body.label === 'ball' || body.label === 'bomb') World.remove(world, body);
+  }
+  if (currentBall) { World.remove(world, currentBall); currentBall = null; }
+  ballBodies.clear();
+  mergeQueue = []; mergedThisFrame.clear();
+  particles = []; floatTexts = []; chainTexts = [];
+  flashAlpha = 0; shakeAmount = 0; deadlineTimer = 0;
+  chainCount = 0; chainTimer = 0; lastDropTime = 0;
+  score = 0; gameOver = false; canDrop = true; isNewRecord = false; accumulator = 0;
+  currentLevel = randLevel(); nextLevel = randLevel();
+  dropX = AREA_X + AREA_W / 2; pointerX = dropX;
+
+  // Reset mission & bomb state
+  currentMission = null;
+  missionCount = 0;
+  missionCompleteEffect = null;
+  missionTransitionTimer = 0;
+  bombStock = 0;
+  bombMode = false;
+  bombExplosions = [];
+  totalMergeCount = 0;
+  lastMissionType = null;
+
+  generateNextMission();
+  spawnHeldBall();
+}
+
+// ========== INPUT ==========
+function setupInput() {
+  function toGameCoords(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: (clientX - r.left) / canvasScale, y: (clientY - r.top) / canvasScale };
+  }
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (gameOver || showTitle) return;
+    const g = toGameCoords(e.clientX, e.clientY);
+    pointerX = g.x;
+    updateHeldPos();
+  });
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (showTitle) { showTitle = false; return; }
+    const g = toGameCoords(e.clientX, e.clientY);
+    if (gameOver) {
+      tryRetry(g.x, g.y);
+      return;
+    }
+    if (tryBombButton(g.x, g.y)) return;
+    pointerX = g.x;
+    updateHeldPos();
+    doDrop();
+  });
+
+  let touchActive = false;
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    if (showTitle) { showTitle = false; return; }
+    const t = e.touches[0];
+    const g = toGameCoords(t.clientX, t.clientY);
+    if (gameOver) return;
+    if (tryBombButton(g.x, g.y)) return;
+    pointerX = g.x;
+    updateHeldPos();
+    touchActive = true;
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (gameOver || !touchActive) return;
+    const t = e.touches[0];
+    const g = toGameCoords(t.clientX, t.clientY);
+    pointerX = g.x;
+    updateHeldPos();
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    if (gameOver) {
+      touchActive = false;
+      if (e.changedTouches.length > 0) {
+        const t = e.changedTouches[0];
+        const g = toGameCoords(t.clientX, t.clientY);
+        tryRetry(g.x, g.y);
+      }
+      return;
+    }
+    if (touchActive) { doDrop(); touchActive = false; }
+  }, { passive: false });
+}
+
+function updateHeldPos() {
+  if (!currentBall) return;
+  dropX = pointerX;
+  const cx = clampDropX(currentLevel);
+  Body.setPosition(currentBall, { x: cx, y: DROP_Y });
+}
+
+const RETRY_BTN = { x: GAME_WIDTH / 2 - 80, y: 470, w: 160, h: 50 };
+const BOMB_BTN = { x: AREA_X + AREA_W - 90, y: 104, w: 90, h: 28 };
+function tryRetry(mx, my) {
+  if (mx >= RETRY_BTN.x && mx <= RETRY_BTN.x + RETRY_BTN.w &&
+      my >= RETRY_BTN.y && my <= RETRY_BTN.y + RETRY_BTN.h) {
+    resetGame();
+  }
+}
+
+function tryBombButton(mx, my) {
+  const b = BOMB_BTN;
+  if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
+    if (bombStock > 0) {
+      bombMode = !bombMode;
+    }
+    return true;
+  }
+  return false;
+}
+
+// ========== GAME LOOP ==========
+let lastTime = 0;
+const FIXED_DT = 1000 / 60;
+let accumulator = 0;
+let frameAllBodies = [];
+
+function loop(ts) {
+  const elapsed = lastTime ? Math.min(ts - lastTime, 50) : FIXED_DT;
+  lastTime = ts;
+
+  if (!gameOver && !showTitle) {
+    updateHeldPos();
+    accumulator += elapsed;
+    while (accumulator >= FIXED_DT) {
+      Engine.update(engine, FIXED_DT);
+      processMerges();
+      accumulator -= FIXED_DT;
+    }
+    frameAllBodies = Composite.allBodies(world);
+    checkDeadline(FIXED_DT);
+    cleanupOutOfBounds();
+  }
+  updateEffects(FIXED_DT);
+  render();
+  requestAnimationFrame(loop);
+}
+
+function cleanupOutOfBounds() {
+  const bodyMap = new Map();
+  for (const b of frameAllBodies) {
+    if (b.label === 'ball' || b.label === 'bomb') bodyMap.set(b.id, b);
+  }
+  for (const [id] of ballBodies) {
+    const body = bodyMap.get(id);
+    if (!body) { ballBodies.delete(id); continue; }
+    if (body.position.y > AREA_Y + AREA_H + 200 || body.position.x < -200 || body.position.x > GAME_WIDTH + 200) {
+      World.remove(world, body);
+      ballBodies.delete(id);
+    }
+  }
+}
+
+// ========== RENDERING ==========
+function render() {
+  ctx.save();
+  ctx.scale(canvasScale, canvasScale);
+  if (showTitle) {
+    drawTitleScreen();
+    ctx.restore();
+    return;
+  }
+  ctx.translate(shakeAmount, 0);
+
+  // Background
+  ctx.fillStyle = '#3E2723';
+  ctx.fillRect(-20, 0, GAME_WIDTH + 40, GAME_HEIGHT);
+
+  // Game area background
+  ctx.fillStyle = '#FFF8E1';
+  ctx.fillRect(AREA_X, AREA_Y, AREA_W, AREA_H);
+
+  // Walls
+  ctx.fillStyle = '#5D4037';
+  ctx.fillRect(AREA_X - WALL_T, AREA_Y, WALL_T, AREA_H + WALL_T);
+  ctx.fillRect(AREA_X + AREA_W, AREA_Y, WALL_T, AREA_H + WALL_T);
+  ctx.fillRect(AREA_X - WALL_T, AREA_Y + AREA_H, AREA_W + WALL_T * 2, WALL_T);
+
+  drawDeadline();
+
+  // Drop guide
+  if (currentBall && !gameOver) drawDropGuide();
+
+  // Clip ball rendering to game area
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(AREA_X, AREA_Y, AREA_W, AREA_H);
+  ctx.clip();
+
+  // All active balls
+  const allB = frameAllBodies.length > 0 ? frameAllBodies : Composite.allBodies(world);
+  for (const body of allB) {
+    if (body.label !== 'ball' && body.label !== 'bomb') continue;
+    if (body === currentBall) continue;
+    const info = ballBodies.get(body.id);
+    if (info) {
+      if (body.label === 'bomb' || info.isBomb) {
+        drawBombBall(body, info.level);
+      } else {
+        drawBall(body, info.level);
+      }
+    }
+  }
+
+  // Held ball
+  if (currentBall && !gameOver) {
+    if (bombMode && bombStock > 0) {
+      drawBombBall(currentBall, currentLevel, 0.85);
+    } else {
+      drawBall(currentBall, currentLevel, 0.85);
+    }
+  }
+
+  // Effects
+  drawBombExplosions();
+  drawParticles();
+  drawFloatTexts();
+  drawChainTexts();
+
+  if (flashAlpha > 0) {
+    ctx.fillStyle = 'rgba(255,255,255,' + flashAlpha + ')';
+    ctx.fillRect(AREA_X, AREA_Y, AREA_W, AREA_H);
+  }
+
+  // Mission complete effect
+  if (missionCompleteEffect && missionCompleteEffect.alpha > 0) {
+    ctx.save();
+    ctx.globalAlpha = missionCompleteEffect.alpha;
+    ctx.font = 'bold 28px "Segoe UI", Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const mcx = AREA_X + AREA_W / 2;
+    const mcy = AREA_Y + AREA_H * 0.3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth = 4;
+    ctx.strokeText('MISSION CLEAR!', mcx, mcy);
+    ctx.fillStyle = '#4CAF50';
+    ctx.fillText('MISSION CLEAR!', mcx, mcy);
+    ctx.font = 'bold 18px "Segoe UI", Arial, sans-serif';
+    ctx.fillStyle = '#FFEB3B';
+    ctx.strokeText('BOMB +1', mcx, mcy + 35);
+    ctx.fillText('BOMB +1', mcx, mcy + 35);
+    ctx.restore();
+  }
+
+  ctx.restore(); // Remove clip
+
+  // Header drawn AFTER balls so it's always on top
+  drawHeader();
+
+  if (gameOver) drawGameOverScreen();
+
+  ctx.restore();
+}
+
+function drawHeader() {
+  // Header background (covers any ball overflow)
+  ctx.fillStyle = '#3E2723';
+  ctx.fillRect(-20, 0, GAME_WIDTH + 40, AREA_Y);
+
+  // Title
+  ctx.fillStyle = '#FFECB3';
+  ctx.font = 'bold 24px "Segoe UI", Arial, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText('Ball Merge Game', GAME_WIDTH / 2, 6);
+
+  // Score / Best
+  ctx.font = 'bold 16px "Segoe UI", Arial, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillText('SCORE: ' + score, AREA_X, 36);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#FFD54F';
+  ctx.fillText('BEST: ' + highScore, AREA_X + AREA_W, 36);
+
+  // Current ball name (left) + NEXT preview (right) on same row
+  if (!gameOver && currentBall) {
+    ctx.font = '13px "Segoe UI", Arial, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    if (bombMode && bombStock > 0) {
+      ctx.fillStyle = '#FF9800';
+      ctx.fillText('BOMB Lv.' + currentLevel, AREA_X, 62);
+    } else {
+      ctx.fillStyle = '#FFCC80';
+      ctx.fillText(BALL_DATA[currentLevel].name, AREA_X, 62);
+    }
+  }
+
+  // NEXT: label + mini ball (right side, compact)
+  ctx.fillStyle = '#BDBDBD';
+  ctx.font = '11px "Segoe UI", Arial, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('NEXT', AREA_X + AREA_W - 22, 62);
+  const pr = Math.min(BALL_DATA[nextLevel].r, 13);
+  ctx.save();
+  drawBallGraphic(AREA_X + AREA_W - 8, 62, pr, nextLevel);
+  ctx.restore();
+
+  // Evolution chart (full width, own row)
+  drawEvolutionChart();
+
+  // Mission row
+  drawMissionRow();
+}
+
+function drawMissionRow() {
+  const rowY = 110;
+
+  // Mission text (left side)
+  if (currentMission) {
+    ctx.fillStyle = '#FFCC80';
+    ctx.font = 'bold 11px "Segoe UI", Arial, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('MISSION: ' + currentMission.shortDesc, AREA_X, rowY);
+
+    // Progress bar
+    const barX = AREA_X;
+    const barY = rowY + 14;
+    const barW = Math.min(200, BOMB_BTN.x - AREA_X - 10);
+    const barH = 6;
+    const progress = Math.min(currentMission.progress / currentMission.goal, 1);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillRect(barX, barY, barW, barH);
+
+    ctx.fillStyle = progress >= 1 ? '#4CAF50' : '#FF9800';
+    ctx.fillRect(barX, barY, barW * progress, barH);
+
+    ctx.fillStyle = '#BDBDBD';
+    ctx.font = '10px "Segoe UI", Arial, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(currentMission.progress + '/' + currentMission.goal, barX + barW + 4, barY + 3);
+  } else if (missionTransitionTimer > 0) {
+    ctx.fillStyle = '#4CAF50';
+    ctx.font = 'bold 12px "Segoe UI", Arial, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('MISSION COMPLETE!', AREA_X, rowY + 4);
+  }
+
+  // Bomb button (right side)
+  drawBombButton();
+}
+
+function drawBombButton() {
+  const b = BOMB_BTN;
+  const enabled = bombStock > 0;
+  const active = bombMode;
+
+  ctx.fillStyle = enabled ? (active ? 'rgba(255,152,0,0.3)' : 'rgba(255,255,255,0.1)') : 'rgba(128,128,128,0.15)';
+  ctx.strokeStyle = active ? '#FF9800' : (enabled ? '#FFFFFF' : '#666');
+  ctx.lineWidth = active ? 2 : 1;
+
+  const rad = 6;
+  ctx.beginPath();
+  ctx.moveTo(b.x + rad, b.y);
+  ctx.lineTo(b.x + b.w - rad, b.y);
+  ctx.quadraticCurveTo(b.x + b.w, b.y, b.x + b.w, b.y + rad);
+  ctx.lineTo(b.x + b.w, b.y + b.h - rad);
+  ctx.quadraticCurveTo(b.x + b.w, b.y + b.h, b.x + b.w - rad, b.y + b.h);
+  ctx.lineTo(b.x + rad, b.y + b.h);
+  ctx.quadraticCurveTo(b.x, b.y + b.h, b.x, b.y + b.h - rad);
+  ctx.lineTo(b.x, b.y + rad);
+  ctx.quadraticCurveTo(b.x, b.y, b.x + rad, b.y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = enabled ? '#FFF' : '#666';
+  ctx.font = 'bold 12px "Segoe UI", Arial, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const text = active ? 'BOMB ON' : 'BOMB x' + bombStock;
+  ctx.fillText(text, b.x + b.w / 2, b.y + b.h / 2);
+}
+
+function drawEvolutionChart() {
+  const chartY = 86;
+  const chartR = 8;
+  const padX = 16;
+  const startX = AREA_X + padX;
+  const endX = AREA_X + AREA_W - padX;
+  const spacing = (endX - startX) / (MAX_LEVEL - 1);
+
+  // Subtle background bar
+  ctx.fillStyle = 'rgba(255,255,255,0.05)';
+  ctx.fillRect(AREA_X, chartY - chartR - 4, AREA_W, chartR * 2 + 8);
+
+  for (let i = 1; i <= MAX_LEVEL; i++) {
+    const cx = startX + (i - 1) * spacing;
+
+    ctx.save();
+    drawBallGraphic(cx, chartY, chartR, i);
+    ctx.restore();
+
+    if (i < MAX_LEVEL) {
+      const ax = cx + spacing / 2;
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.beginPath();
+      ctx.moveTo(ax - 2.5, chartY - 3);
+      ctx.lineTo(ax + 2.5, chartY);
+      ctx.lineTo(ax - 2.5, chartY + 3);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+}
+
+function drawDeadline() {
+  ctx.save();
+  const active = deadlineTimer > 0;
+  ctx.strokeStyle = active ? '#F44336' : 'rgba(244,67,54,0.4)';
+  ctx.lineWidth = active ? 2 : 1;
+  ctx.setLineDash([8, 6]);
+  ctx.beginPath();
+  ctx.moveTo(AREA_X, DEADLINE_Y);
+  ctx.lineTo(AREA_X + AREA_W, DEADLINE_Y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  if (active) {
+    ctx.fillStyle = 'rgba(244,67,54,0.12)';
+    ctx.fillRect(AREA_X, AREA_Y, AREA_W, DEADLINE_Y - AREA_Y);
+    ctx.font = 'bold 12px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = '#F44336';
+    const rem = Math.max(0, (DEADLINE_DURATION - deadlineTimer) / 1000).toFixed(1);
+    ctx.fillText('DANGER! ' + rem + 's', AREA_X + AREA_W / 2, DEADLINE_Y - 3);
+  }
+  ctx.restore();
+}
+
+function drawDropGuide() {
+  const cx = clampDropX(currentLevel);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(100,100,100,0.25)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 6]);
+  ctx.beginPath();
+  ctx.moveTo(cx, DROP_Y + BALL_DATA[currentLevel].r + 2);
+  ctx.lineTo(cx, AREA_Y + AREA_H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawBall(body, level, alpha) {
+  ctx.save();
+  if (alpha !== undefined) ctx.globalAlpha = alpha;
+  ctx.translate(body.position.x, body.position.y);
+  const r = BALL_DATA[level].r;
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.beginPath();
+  ctx.ellipse(2, 3, r * 0.9, r * 0.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.rotate(body.angle);
+  drawBallGraphic(0, 0, r, level);
+  ctx.restore();
+}
+
+function drawBombBall(body, level, alpha) {
+  ctx.save();
+  if (alpha !== undefined) ctx.globalAlpha = alpha;
+  ctx.translate(body.position.x, body.position.y);
+  const r = BALL_DATA[level].r;
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.beginPath();
+  ctx.ellipse(2, 3, r * 0.9, r * 0.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.rotate(body.angle);
+  drawBombGraphic(0, 0, r, level);
+  ctx.restore();
+}
+
+function drawBombGraphic(x, y, r, level) {
+  ctx.save();
+  ctx.translate(x, y);
+
+  // Black ball with gradient
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.save();
+  ctx.clip();
+
+  const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, 0, 0, 0, r);
+  g.addColorStop(0, '#555');
+  g.addColorStop(0.5, '#222');
+  g.addColorStop(1, '#000');
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  ctx.restore(); // unclip
+
+  // Orange outline
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.strokeStyle = '#FF9800';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  // Fuse (proportional to ball size)
+  const fuseH = Math.min(r * 0.25, 6);
+  const fuseX = r * 0.08;
+  const fuseY = -r - fuseH;
+  ctx.strokeStyle = '#8D6E63';
+  ctx.lineWidth = Math.max(1.5, r * 0.06);
+  ctx.beginPath();
+  ctx.moveTo(0, -r + 1);
+  ctx.quadraticCurveTo(r * 0.15, -r - fuseH * 0.5, fuseX, fuseY);
+  ctx.stroke();
+
+  // Spark at fuse tip (animated, isolated alpha)
+  ctx.save();
+  const sparkPhase = (Date.now() % 300) / 300;
+  const sparkR = 2 + sparkPhase * 2;
+  ctx.globalAlpha = 1 - sparkPhase * 0.5;
+  ctx.fillStyle = '#FFEB3B';
+  ctx.beginPath();
+  ctx.arc(fuseX, fuseY, sparkR, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.beginPath();
+  ctx.arc(fuseX, fuseY, sparkR * 0.4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Level number
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  const fs = Math.max(8, Math.floor(r * 0.38));
+  ctx.font = 'bold ' + fs + 'px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(level, 0, 1);
+
+  ctx.restore();
+}
+
+function drawBombExplosions() {
+  for (const e of bombExplosions) {
+    const progress = e.elapsed / e.life;
+    const currentRadius = Math.max(1, e.maxRadius * Math.min(1, progress * 2));
+    const alpha = e.alpha * (1 - progress);
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    // Radial gradient fill
+    const g = ctx.createRadialGradient(e.x, e.y, 0, e.x, e.y, currentRadius);
+    g.addColorStop(0, 'rgba(255, 200, 0, 0.6)');
+    g.addColorStop(0.3, 'rgba(255, 100, 0, 0.3)');
+    g.addColorStop(1, 'rgba(255, 50, 0, 0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, currentRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Shockwave ring
+    ctx.strokeStyle = 'rgba(255, 200, 0, ' + (alpha * 0.8) + ')';
+    ctx.lineWidth = 3 * (1 - progress);
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, currentRadius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
+function drawBallGraphic(x, y, r, level) {
+  const d = BALL_DATA[level];
+  ctx.save();
+  ctx.translate(x, y);
+
+  // Clip to circle for clean edges
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.save();
+  ctx.clip();
+
+  switch (level) {
+    case 1: drawPingPong(r, d); break;
+    case 2: drawGolfBall(r, d); break;
+    case 3: drawSquashBall(r, d); break;
+    case 4: drawTennisBall(r, d); break;
+    case 5: drawBaseball(r, d); break;
+    case 6: drawSoftball(r, d); break;
+    case 7: drawHandball(r, d); break;
+    case 8: drawSoccerBall(r, d); break;
+    case 9: drawVolleyball(r, d); break;
+    case 10: drawBasketball(r, d); break;
+    case 11: drawBalanceBall(r, d); break;
+  }
+  ctx.restore(); // unclip
+
+  // Outline
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.strokeStyle = d.outline;
+  ctx.lineWidth = level >= 8 ? 2 : 1.5;
+  ctx.stroke();
+
+  // Level number
+  ctx.fillStyle = (level === 3) ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.35)';
+  const fs = Math.max(8, Math.floor(r * 0.38));
+  ctx.font = 'bold ' + fs + 'px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(level, 0, 1);
+
+  ctx.restore();
+}
+
+// ---- Ball Renderers ----
+
+function drawPingPong(r, d) {
+  ctx.fillStyle = d.color;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Highlight
+  const g = ctx.createRadialGradient(-r * 0.25, -r * 0.3, 0, 0, 0, r);
+  g.addColorStop(0, 'rgba(255,255,255,0.7)');
+  g.addColorStop(0.5, 'rgba(255,255,255,0.1)');
+  g.addColorStop(1, 'rgba(230,230,230,0.1)');
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Brand stripe (like official balls)
+  ctx.fillStyle = 'rgba(255,138,101,0.3)';
+  ctx.fillRect(-r, -r * 0.07, r * 2, r * 0.14);
+}
+
+function drawGolfBall(r, d) {
+  ctx.fillStyle = d.color;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // 3D gradient
+  const g = ctx.createRadialGradient(-r * 0.25, -r * 0.3, 0, 0, 0, r);
+  g.addColorStop(0, 'rgba(255,255,255,0.4)');
+  g.addColorStop(0.5, 'rgba(255,255,255,0)');
+  g.addColorStop(1, 'rgba(200,185,0,0.08)');
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Dimples
+  ctx.fillStyle = 'rgba(180,170,100,0.4)';
+  const pos = [
+    [-0.3,-0.4],[0.3,-0.3],[0.0,0.15],[-0.4,0.25],[0.4,0.3],
+    [0.1,-0.55],[-0.2,0.45],[0.25,0.55],[-0.5,-0.1],[0.5,0.05],
+    [-0.15,-0.15],[0.15,0.0],[-0.35,0.5],[0.0,-0.3],[0.35,-0.55]
+  ];
+  for (const [px, py] of pos) {
+    ctx.beginPath();
+    ctx.arc(px * r, py * r, r * 0.065, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawSquashBall(r, d) {
+  ctx.fillStyle = d.color;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, 0, 0, 0, r * 1.1);
+  g.addColorStop(0, 'rgba(255,255,255,0.45)');
+  g.addColorStop(0.4, 'rgba(255,255,255,0.05)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Yellow speed dots (like real squash balls)
+  ctx.fillStyle = '#FFD600';
+  ctx.beginPath();
+  ctx.arc(r * 0.28, r * 0.22, r * 0.12, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(r * 0.48, r * 0.22, r * 0.12, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawTennisBall(r, d) {
+  ctx.fillStyle = d.color;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Seam lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  ctx.lineWidth = Math.max(1.5, r * 0.07);
+  ctx.beginPath();
+  ctx.arc(-r * 0.5, 0, r * 0.72, -Math.PI * 0.55, Math.PI * 0.55);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(r * 0.5, 0, r * 0.72, Math.PI * 0.45, Math.PI * 1.55);
+  ctx.stroke();
+}
+
+function drawBaseball(r, d) {
+  ctx.fillStyle = d.color;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  ctx.strokeStyle = '#D32F2F';
+  ctx.lineWidth = Math.max(1.2, r * 0.05);
+  // Stitch curves
+  ctx.beginPath();
+  ctx.arc(-r * 0.45, 0, r * 0.65, -Math.PI * 0.55, Math.PI * 0.55);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(r * 0.45, 0, r * 0.65, Math.PI * 0.45, Math.PI * 1.55);
+  ctx.stroke();
+  // Tick marks along left curve
+  const tickW = r * 0.07;
+  for (let i = -3; i <= 3; i++) {
+    const a = i * 0.15;
+    const cx = -r * 0.45 + Math.cos(a) * r * 0.65;
+    const cy = Math.sin(a) * r * 0.65;
+    const nx = Math.cos(a), ny = Math.sin(a);
+    ctx.beginPath();
+    ctx.moveTo(cx - ny * tickW, cy + nx * tickW);
+    ctx.lineTo(cx + ny * tickW, cy - nx * tickW);
+    ctx.stroke();
+  }
+  // Tick marks along right curve
+  for (let i = -3; i <= 3; i++) {
+    const a = Math.PI + i * 0.15;
+    const cx = r * 0.45 + Math.cos(a) * r * 0.65;
+    const cy = Math.sin(a) * r * 0.65;
+    const nx = Math.cos(a), ny = Math.sin(a);
+    ctx.beginPath();
+    ctx.moveTo(cx - ny * tickW, cy + nx * tickW);
+    ctx.lineTo(cx + ny * tickW, cy - nx * tickW);
+    ctx.stroke();
+  }
+}
+
+function drawSoftball(r, d) {
+  ctx.fillStyle = d.color;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  ctx.strokeStyle = '#D32F2F';
+  ctx.lineWidth = Math.max(1.5, r * 0.05);
+  ctx.beginPath();
+  ctx.arc(-r * 0.4, 0, r * 0.6, -Math.PI * 0.6, Math.PI * 0.6);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(r * 0.4, 0, r * 0.6, Math.PI * 0.4, Math.PI * 1.6);
+  ctx.stroke();
+  // Stitch marks
+  const tw = r * 0.06;
+  for (let i = -3; i <= 3; i++) {
+    const a = i * 0.2;
+    const cx1 = -r * 0.4 + Math.cos(a) * r * 0.6;
+    const cy1 = Math.sin(a) * r * 0.6;
+    ctx.beginPath();
+    ctx.moveTo(cx1 - tw, cy1 - tw);
+    ctx.lineTo(cx1 + tw, cy1 + tw);
+    ctx.stroke();
+  }
+}
+
+function drawHandball(r, d) {
+  ctx.fillStyle = d.color;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // 3D gradient
+  const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, 0, 0, 0, r);
+  g.addColorStop(0, 'rgba(255,255,255,0.25)');
+  g.addColorStop(0.6, 'rgba(255,255,255,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.1)');
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Panel lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+  ctx.lineWidth = Math.max(2, r * 0.1);
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.65, -r * 0.78);
+  ctx.quadraticCurveTo(0, -r * 0.05, r * 0.65, -r * 0.78);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.65, r * 0.78);
+  ctx.quadraticCurveTo(0, r * 0.05, r * 0.65, r * 0.78);
+  ctx.stroke();
+  // Grip texture dots
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  for (let gi = 0; gi < 5; gi++) {
+    for (let gj = 0; gj < 3; gj++) {
+      ctx.beginPath();
+      ctx.arc(-r * 0.24 + gi * r * 0.12, -r * 0.08 + gj * r * 0.08, r * 0.02, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawSoccerBall(r, d) {
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Black pentagons
+  ctx.fillStyle = '#333';
+  drawPentagonShape(0, 0, r * 0.28);
+  const pa = [0, Math.PI * 0.4, Math.PI * 0.8, Math.PI * 1.2, Math.PI * 1.6];
+  for (const a of pa) {
+    drawPentagonShape(Math.cos(a) * r * 0.6, Math.sin(a) * r * 0.6, r * 0.18);
+  }
+  // Connecting lines
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = Math.max(0.8, r * 0.025);
+  for (let i = 0; i < 5; i++) {
+    const a = Math.PI * 2 * i / 5 - Math.PI / 2;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * r * 0.28, Math.sin(a) * r * 0.28);
+    ctx.lineTo(Math.cos(a) * r * 0.55, Math.sin(a) * r * 0.55);
+    ctx.stroke();
+  }
+}
+
+function drawPentagonShape(cx, cy, sz) {
+  ctx.beginPath();
+  for (let i = 0; i < 5; i++) {
+    const a = (Math.PI * 2 * i) / 5 - Math.PI / 2;
+    const px = cx + Math.cos(a) * sz;
+    const py = cy + Math.sin(a) * sz;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawVolleyball(r, d) {
+  const g = ctx.createRadialGradient(-r * 0.2, -r * 0.2, 0, 0, 0, r);
+  g.addColorStop(0, '#BBDEFB');
+  g.addColorStop(0.6, d.color);
+  g.addColorStop(1, '#1E88E5');
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Subtle yellow panel fill
+  ctx.fillStyle = 'rgba(255,235,59,0.07)';
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.quadraticCurveTo(r * 0.35, 0, 0, r);
+  ctx.quadraticCurveTo(-r * 0.1, 0, 0, -r);
+  ctx.fill();
+  // Panel lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = Math.max(1.5, r * 0.045);
+  ctx.beginPath();
+  ctx.moveTo(0, -r * 1.05);
+  ctx.quadraticCurveTo(r * 0.3, 0, 0, r * 1.05);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.9, -r * 0.55);
+  ctx.quadraticCurveTo(-r * 0.1, 0, -r * 0.9, r * 0.55);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(r * 0.9, -r * 0.55);
+  ctx.quadraticCurveTo(r * 0.1, 0, r * 0.9, r * 0.55);
+  ctx.stroke();
+}
+
+function drawBasketball(r, d) {
+  const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, 0, 0, 0, r);
+  g.addColorStop(0, '#FF8F00');
+  g.addColorStop(1, d.color);
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Lines
+  ctx.strokeStyle = '#3E2723';
+  ctx.lineWidth = Math.max(1.5, r * 0.04);
+  ctx.beginPath(); ctx.moveTo(-r * 1.1, 0); ctx.lineTo(r * 1.1, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, -r * 1.1); ctx.lineTo(0, r * 1.1); ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(-r * 0.7, 0, r * 0.75, -Math.PI * 0.38, Math.PI * 0.38);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(r * 0.7, 0, r * 0.75, Math.PI * 0.62, Math.PI * 1.38);
+  ctx.stroke();
+}
+
+function drawBalanceBall(r, d) {
+  const g = ctx.createRadialGradient(-r * 0.35, -r * 0.35, r * 0.05, 0, 0, r);
+  g.addColorStop(0, '#F8BBD0');
+  g.addColorStop(0.4, d.color);
+  g.addColorStop(1, '#C2185B');
+  ctx.fillStyle = g;
+  ctx.fillRect(-r, -r, r * 2, r * 2);
+  // Vertical ribs (balance ball grooves)
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = r * 0.02;
+  for (let ri = -3; ri <= 3; ri++) {
+    const rx = ri * r * 0.22;
+    ctx.beginPath();
+    ctx.moveTo(rx, -r);
+    ctx.lineTo(rx, r);
+    ctx.stroke();
+  }
+  // Highlight ellipse
+  ctx.beginPath();
+  ctx.ellipse(-r * 0.28, -r * 0.3, r * 0.35, r * 0.2, -Math.PI / 4, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.fill();
+  // Equator ring
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.72, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth = r * 0.03;
+  ctx.stroke();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, p.alpha);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(0.5, p.r * p.alpha), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawFloatTexts() {
+  for (const f of floatTexts) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, f.alpha);
+    ctx.font = 'bold 18px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 3;
+    ctx.strokeText(f.text, f.x, f.y);
+    ctx.fillStyle = f.color;
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.restore();
+  }
+}
+
+function drawChainTexts() {
+  for (const c of chainTexts) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, c.alpha);
+    const fs = Math.floor(30 * c.scl);
+    ctx.font = 'bold ' + fs + 'px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const cx = AREA_X + AREA_W / 2;
+    const cy = AREA_Y + AREA_H * 0.35;
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth = 4;
+    ctx.strokeText(c.text, cx, cy);
+    ctx.fillStyle = c.color;
+    ctx.fillText(c.text, cx, cy);
+    ctx.restore();
+  }
+}
+
+function drawTitleScreen() {
+  // Gradient background
+  const bgGrad = ctx.createLinearGradient(0, 0, 0, GAME_HEIGHT);
+  bgGrad.addColorStop(0, '#3E2723');
+  bgGrad.addColorStop(0.5, '#2D1B14');
+  bgGrad.addColorStop(1, '#1A0E0A');
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+
+  const cx = GAME_WIDTH / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // Title shadow + text
+  ctx.font = 'bold 34px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillText('Ball Merge Game', cx + 2, 37);
+  ctx.fillStyle = '#FFECB3';
+  ctx.fillText('Ball Merge Game', cx, 35);
+
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#8D6E63';
+  ctx.fillText('スポーツボール落ちものパズル', cx, 58);
+
+  if (highScore > 0) {
+    ctx.font = 'bold 12px "Segoe UI", Arial, sans-serif';
+    ctx.fillStyle = '#FFD54F';
+    ctx.fillText('HIGH SCORE: ' + highScore, cx, 78);
+  }
+
+  // Evolution chart
+  const chartBaseY = highScore > 0 ? 105 : 95;
+  const chartW = GAME_WIDTH - 60;
+  const csp = chartW / 10;
+  for (let i = 1; i <= MAX_LEVEL; i++) {
+    const bx = 30 + (i - 1) * csp;
+    ctx.save();
+    drawBallGraphic(bx, chartBaseY, 8, i);
+    ctx.restore();
+  }
+  ctx.font = '8px "Segoe UI", sans-serif';
+  ctx.fillStyle = '#5D4037';
+  ctx.textAlign = 'left';
+  ctx.fillText('Lv.1', 18, chartBaseY + 16);
+  ctx.textAlign = 'right';
+  ctx.fillText('Lv.11', GAME_WIDTH - 18, chartBaseY + 16);
+
+  // ── あそびかた ──
+  const playY = chartBaseY + 36;
+  drawTitleSectionLine(playY, 'あそびかた', '#FFECB3');
+
+  ctx.textAlign = 'left';
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  const rules = [
+    '左右に動かして落下位置を調整',
+    'クリック / タップでボールを落とす',
+    '同じボール同士がぶつかると合体して進化！',
+    '最大レベル(Lv.11)同士は消滅してボーナス',
+    '赤いラインを超え続けるとゲームオーバー'
+  ];
+  for (let i = 0; i < rules.length; i++) {
+    const ry = playY + 24 + i * 20;
+    ctx.fillStyle = '#8D6E63';
+    ctx.fillText('\u25B8', 28, ry);
+    ctx.fillStyle = '#D7CCC8';
+    ctx.fillText(rules[i], 42, ry);
+  }
+
+  // ── 連鎖ボーナス ──
+  const chainSecY = playY + 24 + rules.length * 20 + 16;
+  drawTitleSectionLine(chainSecY, '連鎖ボーナス', '#FFECB3');
+  ctx.textAlign = 'center';
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#D7CCC8';
+  ctx.fillText('合体が連続すると連鎖ボーナス！', cx, chainSecY + 22);
+  ctx.font = '11px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#FFCC80';
+  ctx.fillText('2連鎖\u00D71.5   3連鎖\u00D72.0   4連鎖\u00D72.5 ...', cx, chainSecY + 42);
+
+  // ── ボムシステム ──
+  const bombSecY = chainSecY + 68;
+  drawTitleSectionLine(bombSecY, 'ボムシステム', '#FF9800');
+
+  // Bomb icon on left
+  ctx.save();
+  drawBombGraphic(50, bombSecY + 70, 20, 3);
+  ctx.restore();
+
+  ctx.textAlign = 'left';
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  const bombRules = [
+    'ミッションクリアでボムを獲得！',
+    '右上の BOMB ボタンでモード切替',
+    'ボムモードでボールを落とすと爆弾に変化',
+    '爆弾は何かにぶつかると大爆発！',
+    '爆発範囲内の同レベル以下のボールを破壊'
+  ];
+  for (let i = 0; i < bombRules.length; i++) {
+    const ry = bombSecY + 24 + i * 21;
+    ctx.fillStyle = '#BF360C';
+    ctx.fillText('\u25B8', 82, ry);
+    ctx.fillStyle = '#FFCC80';
+    ctx.fillText(bombRules[i], 96, ry);
+  }
+  ctx.font = '10px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#795548';
+  ctx.textAlign = 'left';
+  const noteY = bombSecY + 24 + bombRules.length * 21 + 6;
+  ctx.fillText('\u203B \u7206\u5F3E\u306E\u30EC\u30D9\u30EB = \u843D\u3068\u3059\u30DC\u30FC\u30EB\u306E\u30EC\u30D9\u30EB', 82, noteY);
+  ctx.fillText('\u203B \u30EC\u30D9\u30EB\u304C\u9AD8\u3044\u307B\u3069\u7206\u767A\u7BC4\u56F2\u304C\u5E83\u3044', 82, noteY + 16);
+
+  // ── ミッション ──
+  const missionSecY = noteY + 44;
+  drawTitleSectionLine(missionSecY, 'ミッション', '#4CAF50');
+  ctx.textAlign = 'center';
+  ctx.font = '12px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#A5D6A7';
+  ctx.fillText('プレイ中にミッションが出現！', cx, missionSecY + 22);
+  ctx.fillText('達成するとボムを獲得できる', cx, missionSecY + 42);
+
+  // ── START PROMPT ──
+  const startY = Math.max(missionSecY + 80, 650);
+  const pulse = 0.6 + Math.sin(Date.now() * 0.004) * 0.4;
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  ctx.font = 'bold 24px "Segoe UI", Arial, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFECB3';
+  ctx.fillText('TAP TO START', cx, startY);
+  ctx.restore();
+
+  ctx.font = '10px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#5D4037';
+  ctx.textAlign = 'center';
+  ctx.fillText('\u30AF\u30EA\u30C3\u30AF or \u30BF\u30C3\u30D7\u3067\u30B2\u30FC\u30E0\u958B\u59CB', cx, startY + 25);
+}
+
+function drawTitleSectionLine(y, text, color) {
+  const cx = GAME_WIDTH / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 14px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = color || '#FFECB3';
+  const tw = ctx.measureText(text).width;
+  ctx.save();
+  ctx.strokeStyle = color || '#FFECB3';
+  ctx.globalAlpha = 0.3;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(30, y);
+  ctx.lineTo(cx - tw / 2 - 10, y);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx + tw / 2 + 10, y);
+  ctx.lineTo(GAME_WIDTH - 30, y);
+  ctx.stroke();
+  ctx.restore();
+  ctx.fillText(text, cx, y);
+}
+
+function drawGameOverScreen() {
+  ctx.fillStyle = 'rgba(0,0,0,0.72)';
+  ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 42px "Segoe UI", Arial, sans-serif';
+  ctx.fillText('GAME OVER', GAME_WIDTH / 2, 300);
+
+  ctx.font = 'bold 26px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#FFD54F';
+  ctx.fillText('SCORE: ' + score, GAME_WIDTH / 2, 355);
+
+  if (isNewRecord) {
+    ctx.font = 'bold 22px "Segoe UI", Arial, sans-serif';
+    ctx.fillStyle = '#FF4081';
+    ctx.fillText('NEW RECORD!', GAME_WIDTH / 2, 395);
+  }
+
+  ctx.font = '16px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#BDBDBD';
+  ctx.fillText('BEST: ' + highScore, GAME_WIDTH / 2, 425);
+
+  ctx.font = '14px "Segoe UI", Arial, sans-serif';
+  ctx.fillStyle = '#FFCC80';
+  ctx.fillText('MISSIONS: ' + missionCount, GAME_WIDTH / 2, 450);
+
+  // Retry button
+  const b = RETRY_BTN;
+  const rad = 12;
+  ctx.beginPath();
+  ctx.moveTo(b.x + rad, b.y);
+  ctx.lineTo(b.x + b.w - rad, b.y);
+  ctx.quadraticCurveTo(b.x + b.w, b.y, b.x + b.w, b.y + rad);
+  ctx.lineTo(b.x + b.w, b.y + b.h - rad);
+  ctx.quadraticCurveTo(b.x + b.w, b.y + b.h, b.x + b.w - rad, b.y + b.h);
+  ctx.lineTo(b.x + rad, b.y + b.h);
+  ctx.quadraticCurveTo(b.x, b.y + b.h, b.x, b.y + b.h - rad);
+  ctx.lineTo(b.x, b.y + rad);
+  ctx.quadraticCurveTo(b.x, b.y, b.x + rad, b.y);
+  ctx.closePath();
+  ctx.fillStyle = '#4CAF50';
+  ctx.fill();
+  ctx.strokeStyle = '#388E3C';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 22px "Segoe UI", Arial, sans-serif';
+  ctx.fillText('Retry', b.x + b.w / 2, b.y + b.h / 2);
+}
+
+// ========== START ==========
+init();
+
+})();
+</script>
+</body>
+</html>
